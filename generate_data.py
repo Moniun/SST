@@ -1,30 +1,68 @@
 import requests
 import json
 import time
+import os
 from typing import List, Dict
-from utils.config import LLMConfig
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
 
 def generate_single_sample(api_url: str, api_key: str, model_name: str) -> Dict:
     """生成单条记忆训练数据（支持自定义API地址和模型）"""
     prompt = """
-    任务：生成用于训练大模型长期记忆能力的对话数据集。
-    要求：
-    1. 先生成一段多轮对话（2-10轮），主题随机（日常、工作、学习等）。
-    2. 对话包含至少3个关键信息点（如时间、地点、事件、属性等）。
-    3. 生成1个针对历史内容的记忆查询（例如：“我第2句话提到了什么？”“刚才说的XX是指什么？”）。
-    4. 答案必须从对话历史中提取，不编造信息。
-    5. 仅输出JSON，包含dialog_history（数组）、memory_query（字符串）、memory_answer（字符串）。
-    示例输出：
+    Task: Generate a high-quality dialogue dataset for training large models' long-term memory capabilities.
+    Requirements:
+    1. Generate a coherent, multi-turn conversation (3-8 turns) on any random topic.
+    2. Ensure the conversation has natural flow with logical transitions between turns.
+    3. Include 4-6 key information points of varying types: numbers, dates, names, locations, descriptions, preferences, or specific events.
+    4. The information should be distributed throughout the conversation history (not all in one message).
+    5. Create a memory query of varying difficulty level (easy, medium, or hard):
+       - Easy: Direct information retrieval from one message
+       - Medium: Information requiring connection between multiple messages
+       - Hard: Implicit information that requires inference from context
+    6. The memory_answer must be strictly extracted from the dialogue history without any fabrication.
+    7. Format: Output only valid JSON with exactly these fields: dialog_history (array of strings), memory_query (string), memory_answer (string).
+    8. IMPORTANT: Do NOT include "User:" or "Assistant:" prefixes in the dialog_history entries. Just include the raw conversation content.
+    9. CRITICAL: Make sure to output ONLY the JSON and nothing else (no markdown, no explanations, no tags).
+    
+    Example 1 (Easy Memory Query):
     {
       "dialog_history": [
-        "用户：我喜欢打篮球，每周六下午会和朋友去体育馆。",
-        "助手：体育馆人多吗？需要提前预约吗？",
-        "用户：是的，要提前一天预约，我们一般打2小时，然后去吃火锅。",
-        "助手：你们常去的火锅店叫什么名字？",
-        "用户：叫‘老地方火锅’，就在体育馆对面。"
+        "I'm planning a trip to Paris next month. I'll stay at Hotel Grand Paris for 5 nights.",
+        "That sounds wonderful! What are your main plans in Paris?",
+        "I want to visit the Eiffel Tower, Louvre Museum, and take a Seine River cruise. I also booked tickets for a concert at the Opera Garnier.",
+        "The Opera Garnier is beautiful! Which day is your concert?",
+        "It's scheduled for July 15th at 8 PM."
       ],
-      "memory_query": "我每周什么时候去打篮球？",
-      "memory_answer": "你每周六下午去打篮球。"
+      "memory_query": "Where will I stay during my trip to Paris?",
+      "memory_answer": "You'll stay at Hotel Grand Paris."
+    }
+    
+    Example 2 (Medium Memory Query):
+    {
+      "dialog_history": [
+        "I have three cats named Max, Luna, and Oliver. Max is the oldest at 7 years old.",
+        "That's a nice family of cats! What breeds are they?",
+        "Max is a Maine Coon, Luna is a Siamese, and Oliver is a tabby with orange fur.",
+        "Do they have any special habits or preferences?",
+        "Luna loves sitting on windowsills and watching birds. Max enjoys napping on the couch, especially when it's sunny."
+      ],
+      "memory_query": "Which cat likes to watch birds?",
+      "memory_answer": "Luna likes to watch birds."
+    }
+    
+    Example 3 (Hard Memory Query):
+    {
+      "dialog_history": [
+        "I started a new job at TechCorp last Monday. The office is on the 12th floor of the Glass Tower building.",
+        "Congratulations on the new job! How's your commute?",
+        "I take the subway every morning, which takes about 25 minutes. Sometimes I stop at the café near the station for coffee.",
+        "Do you have any colleagues you've gotten to know yet?",
+        "Yes, my team leader Sarah is very helpful. She showed me around on my first day and introduced me to everyone."
+      ],
+      "memory_query": "What did Sarah do to help on the first day of work?",
+      "memory_answer": "Sarah showed me around on my first day and introduced me to everyone."
     }
     """
     
@@ -53,15 +91,38 @@ def generate_single_sample(api_url: str, api_key: str, model_name: str) -> Dict:
         response.raise_for_status()  # 检查HTTP错误状态
         response_data = response.json()
         
-        # 提取生成内容（根据不同模型的响应结构调整此处）
-        # 常见结构1: OpenAI/DeepSeek类 -> choices[0].message.content
-        # 常见结构2: 其他模型可能使用 -> data[0].content 等
-        content = response_data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        # 简化版内容提取和解析
+        # 尝试获取OpenAI/DeepSeek格式的响应内容
+        try:
+            content = response_data['choices'][0]['message']['content'].strip()
+        except (KeyError, IndexError):
+            # 尝试获取其他可能的响应格式
+            try:
+                content = response_data['data'][0]['content'].strip()
+            except (KeyError, IndexError, TypeError):
+                content = str(response_data)
+                print(f"警告: 使用备用响应结构: {content[:100]}...")
+        
+        # 清理内容并提取JSON部分
+        if content.startswith('```'):
+            content = '\n'.join([line for line in content.split('\n') if not line.strip().startswith('```')])
+        
+        # 提取JSON对象
+        json_start, json_end = content.find('{'), content.rfind('}')
+        if json_start >= 0 and json_end > json_start:
+            content = content[json_start:json_end+1]
         
         if not content:
             raise ValueError("模型返回内容为空")
-            
-        return json.loads(content)
+        
+        # 解析并验证JSON
+        parsed_data = json.loads(content)
+        required_fields = ['dialog_history', 'memory_query', 'memory_answer']
+        if not all(field in parsed_data for field in required_fields):
+            missing = [f for f in required_fields if f not in parsed_data]
+            raise ValueError(f"缺少必要字段: {', '.join(missing)}")
+        
+        return parsed_data
     except Exception as e:
         print(f"生成失败：{e}")
         return None
@@ -92,15 +153,20 @@ def generate_dataset(
 
 if __name__ == "__main__":
     # 配置参数（可根据需要修改为不同模型的信息）
-    llm_config = LLMConfig()
+    # 从环境变量获取API密钥，避免硬编码敏感信息
+    api_key = os.getenv("LLM_API_KEY")
+    
+    if not api_key:
+        print("警告: 未找到环境变量 LLM_API_KEY，请设置API密钥")
+        # 提供一个交互式输入作为备选方案
+        api_key = input("请输入您的API密钥: ")
+    
     config = {
-        # DeepSeek API示例（请替换为实际可用的API地址和密钥）
-        "api_url": "https://api.deepseek.com/v1/chat/completions",  # DeepSeek API地址
-        # "api_url": "https://api.openai.com/v1/chat/completions",  # OpenAI API地址
-        "api_key": llm_config.api_key,  # 替换为实际API密钥
-        "model_name": "deepseek-chat",  # DeepSeek模型名称
-        # "model_name": "gpt-3.5-turbo",  # OpenAI模型名称
-        "num_samples": 5,
+        # DeepSeek API示例（可根据需要修改为不同模型的信息）
+        "api_url": os.getenv("LLM_API_URL", "https://api.deepseek.com/v1/chat/completions"),  # 优先从环境变量获取
+        "api_key": api_key,  # 从环境变量或用户输入获取
+        "model_name": os.getenv("LLM_MODEL_NAME", "deepseek-chat"),  # 优先从环境变量获取
+        "num_samples": 2300,
         "output_file": "memory_train.jsonl"
     }
     

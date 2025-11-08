@@ -1,0 +1,44 @@
+# 敏感文件
+.env
+.env.local
+.env.*.local
+
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 环境文件
+venv/
+env/
+conda_env/
+
+# IDE配置
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# 数据文件
+*.jsonl
+*.json
+*.csv
+*.txt
+
+# 日志文件
+*.log
+
+# 操作系统文件
+Thumbs.db
+.DS_Store
+
+# 编译文件
+*.pyc
+*.pyd
+*.so
+*.dll
+*.a
+*.o
