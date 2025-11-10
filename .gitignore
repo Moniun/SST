@@ -7,6 +7,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
+# 特定Python文件
+validate_data.py
 
 # 环境文件
 venv/
@@ -22,11 +24,14 @@ conda_env/
 *.sln
 *.sw?
 
-# 数据文件
+# 数据文件和目录
 *.jsonl
 *.json
 *.csv
 *.txt
+data/
+data_files/
+models/
 
 # 日志文件
 *.log

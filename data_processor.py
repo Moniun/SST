@@ -2,12 +2,16 @@ from datasets import Dataset, load_dataset
 import json
 import torch
 
-def load_and_preprocess_data(data_path, tokenizer, max_length=None):
+def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None):
     """
-    加载并预处理训练数据，支持dialog_history、memory_query、memory_answer格式
-    data_path: 数据文件路径（JSONL格式）
-    tokenizer: 分词器
-    max_length: 最大序列长度（默认为None，会自动从tokenizer获取模型最大长度）
+    加载并预处理数据，支持dialog_history、memory_query、memory_answer格式
+    
+    Args:
+        data_path: 数据文件路径（JSONL格式）或数据集名称
+        tokenizer: 分词器
+        max_length: 最大序列长度（默认为None，会自动从tokenizer获取模型最大长度）
+        split: 数据集分割名称（用于Hugging Face数据集，如'train'、'validation'、'test'）
+              对于JSONL文件，此参数无效
     """
     # 如果未指定max_length，尝试从tokenizer或其配置中获取模型最大长度
     if max_length is None:
@@ -24,12 +28,24 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None):
         print(f"自动检测到模型最大长度: {max_length}")
     # 加载数据
     if data_path.endswith(".jsonl"):
+        # 直接读取JSONL文件，支持训练集和验证集文件
+        print(f"正在加载JSONL文件: {data_path}")
         with open(data_path, "r", encoding="utf-8") as f:
             data = [json.loads(line) for line in f]
+        print(f"成功加载 {len(data)} 条数据")
     else:
         # 支持Hugging Face数据集
+        print(f"正在加载数据集: {data_path}")
         dataset = load_dataset(data_path)
-        data = list(dataset["train"])  # 使用list()代替to_list()，更通用
+        # 根据指定的split选择数据集分割，默认为'train'
+        split_name = split if split is not None else 'train'
+        if split_name not in dataset:
+            # 如果指定的分割不存在，使用第一个可用的分割
+            available_splits = list(dataset.keys())
+            print(f"警告: 分割 '{split_name}' 不存在，使用第一个可用分割 '{available_splits[0]}'")
+            split_name = available_splits[0]
+        data = list(dataset[split_name])
+        print(f"成功加载数据集分割 '{split_name}'，共 {len(data)} 条数据")
 
     # 转换为Dataset对象
     dataset = Dataset.from_list(data)
@@ -101,7 +117,33 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None):
         }
     
     # 应用预处理
+    print(f"开始预处理数据...")
     # 注意：由于我们需要保留dialog_histories等非张量列，不使用remove_columns
     tokenized_dataset = dataset.map(preprocess_function)
+    print(f"数据预处理完成")
     
     return tokenized_dataset
+
+
+def load_train_val_data(train_path, val_path, tokenizer, max_length=None):
+    """
+    加载并预处理训练集和验证集数据
+    
+    Args:
+        train_path: 训练集文件路径（JSONL格式）
+        val_path: 验证集文件路径（JSONL格式）
+        tokenizer: 分词器
+        max_length: 最大序列长度
+        
+    Returns:
+        tuple: (tokenized_train_dataset, tokenized_val_dataset)
+    """
+    # 加载并预处理训练集
+    print(f"处理训练集: {train_path}")
+    train_dataset = load_and_preprocess_data(train_path, tokenizer, max_length)
+    
+    # 加载并预处理验证集
+    print(f"处理验证集: {val_path}")
+    val_dataset = load_and_preprocess_data(val_path, tokenizer, max_length)
+    
+    return train_dataset, val_dataset

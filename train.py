@@ -6,26 +6,40 @@ from transformers import (
     DataCollatorForLanguageModeling
 )
 from model_customization import ModifiedQwen
-from data_processor import load_and_preprocess_data
+from data_processor import load_train_val_data
 import argparse
+import nltk
+from nltk.translate.meteor_score import meteor_score
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import cos_sim
+
+# 下载METEOR所需的NLTK数据
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+    
+# 初始化Sentence-BERT模型
+sbert_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')  # 多语言模型，支持中文
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-8B-Chat")
-    parser.add_argument("--data_path", type=str, default="demo_training_data.jsonl")
-    parser.add_argument("--test_data_path", type=str, default="demo_test_data.jsonl", help="测试数据路径")
-    parser.add_argument("--output_dir", type=str, default="./qwen3-8b-custom-finetuned")
-    parser.add_argument("--num_train_epochs", type=int, default=3)
-    parser.add_argument("--per_device_train_batch_size", type=int, default=2)
-    parser.add_argument("--per_device_eval_batch_size", type=int, default=2, help="评估时的batch size")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--data_path", type=str, default="data/data_train.jsonl", help="训练数据路径")
+    parser.add_argument("--test_data_path", type=str, default="data/data_val.jsonl", help="验证数据路径")
+    parser.add_argument("--output_dir", type=str, default="./models")
+    parser.add_argument("--num_train_epochs", type=int, default=8)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=8)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=8, help="评估时的batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--max_length", type=int, default=None, help="最大序列长度，默认为None，会自动从tokenizer获取模型最大长度")
-    parser.add_argument("--evaluation_strategy", type=str, default="steps", choices=["no", "epoch", "steps"], help="评估策略")
-    parser.add_argument("--eval_steps", type=int, default=200, help="每多少步进行一次评估")
+    parser.add_argument("--evaluation_strategy", type=str, default="epoch", choices=["no", "epoch", "steps"], help="评估策略")
+    parser.add_argument("--eval_steps", type=int, default=500, help="每多少步进行一次评估")
     parser.add_argument("--eval_accumulation_steps", type=int, default=8, help="评估时的梯度累积步数")
     parser.add_argument("--test_sample_ratio", type=float, default=1.0, help="测试集采样比例，0.0-1.0，用于减少评估时的测试样本数量")
     parser.add_argument("--load_best_model", action="store_true", help="是否在训练结束时加载最佳模型")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="从检查点恢复训练的路径")
     return parser.parse_args()
 
 # 自定义Trainer类，用于处理对话历史的传递和优化的训练流程
@@ -116,7 +130,7 @@ class CustomTrainer(Trainer):
         return self.optimizer
     
     def compute_metrics(self, eval_pred):
-        """计算评估指标"""
+        """计算评估指标，包括准确率、精确率、召回率、F1分数、METEOR和Sentence-BERT语义相似度"""
         predictions, labels = eval_pred
         
         # 获取预测的token IDs（取概率最大的token）
@@ -139,15 +153,59 @@ class CustomTrainer(Trainer):
         recall = true_positives / actual_positives if actual_positives > 0 else 0.0
         f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
         
+        # 使用默认模型名称获取tokenizer
+        # 在实际训练中，应该确保tokenizer与训练时使用的一致
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B-Chat")
+        
+        # 初始化METEOR和Sentence-BERT分数
+        meteor_scores = []
+        sbert_similarities = []
+        
+        # 对每个样本计算METEOR和Sentence-BERT分数
+        for pred, label, msk in zip(predictions, labels, mask):
+            # 过滤掉填充token，获取有效预测和标签
+            valid_pred_ids = pred[msk].tolist()
+            valid_label_ids = label[msk].tolist()
+            
+            # 解码为文本
+            try:
+                pred_text = tokenizer.decode(valid_pred_ids, skip_special_tokens=True)
+                label_text = tokenizer.decode(valid_label_ids, skip_special_tokens=True)
+                
+                # 计算METEOR分数
+                # METEOR需要句子拆分为单词列表
+                pred_tokens = pred_text.split()
+                label_tokens = label_text.split()
+                if len(pred_tokens) > 0 and len(label_tokens) > 0:
+                    meteor = meteor_score([label_tokens], pred_tokens)  # METEOR接受参考句子列表和候选句子
+                    meteor_scores.append(meteor)
+                
+                # 计算Sentence-BERT语义相似度
+                if pred_text.strip() and label_text.strip():
+                    # 生成句子嵌入
+                    embeddings = sbert_model.encode([pred_text, label_text], convert_to_tensor=True)
+                    # 计算余弦相似度
+                    similarity = cos_sim(embeddings[0], embeddings[1]).item()
+                    sbert_similarities.append(similarity)
+            except Exception as e:
+                # 如果解码或评分出错，跳过该样本
+                continue
+        
+        # 计算平均METEOR分数和平均Sentence-BERT相似度
+        avg_meteor = sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0.0
+        avg_sbert_similarity = sum(sbert_similarities) / len(sbert_similarities) if sbert_similarities else 0.0
+        
         return {
             "accuracy": accuracy,
             "precision": precision,
             "recall": recall,
-            "f1": f1_score
+            "f1": f1_score,
+            "meteor": avg_meteor,
+            "sbert_similarity": avg_sbert_similarity
         }
     
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        """重写评估方法，添加更多信息输出"""
+        """重写评估方法，添加更多信息输出，包括METEOR和Sentence-BERT分数"""
         eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         
         print(f"\n开始在测试集上进行评估 (Epoch {self.current_epoch})...")
@@ -161,6 +219,8 @@ class CustomTrainer(Trainer):
         print(f"- 精确率: {metrics.get('eval_precision', 0):.4f}")
         print(f"- 召回率: {metrics.get('eval_recall', 0):.4f}")
         print(f"- F1分数: {metrics.get('eval_f1', 0):.4f}")
+        print(f"- METEOR分数: {metrics.get('eval_meteor', 0):.4f}")
+        print(f"- Sentence-BERT相似度: {metrics.get('eval_sbert_similarity', 0):.4f}")
         print(f"- 测试损失值: {metrics.get('eval_loss', 0):.4f}")
         
         return metrics
@@ -175,7 +235,8 @@ class CustomTrainer(Trainer):
             self.first_epoch_completed = True
             # 解冻需要训练的transformer层
             self._unfreeze_transformer_layers(self.model)
-            # _update_optimizer_parameters方法已经在_unfreeze_transformer_layers内部调用，不需要重复调用
+            # 更新优化器参数组以包含新解冻的参数
+            self._update_optimizer_parameters()
     
     def on_epoch_end(self, epoch, logs=None):
         """在每个epoch结束时的处理"""
@@ -197,15 +258,12 @@ class CustomTrainer(Trainer):
             stage_info = model.advance_training_stage()
             print(stage_info)  # 打印模型返回的阶段信息
             self.transfomer_layers_unfrozen = True
-            
-            # 重新更新优化器参数组以包含新解冻的层
-            self._update_optimizer_parameters(model)
     
-    def _update_optimizer_parameters(self, model):
+    def _update_optimizer_parameters(self):
         """更新优化器参数组，包含新解冻的transformer层"""
         # 获取模型中实际解冻的Transformer层索引
         unfrozen_layer_indices = set()
-        for name, param in model.named_parameters():
+        for name, param in self.model.named_parameters():
             if param.requires_grad and 'transformer.h' in name:
                 # 从参数名中提取层索引，格式通常为 'transformer.h.{layer_idx}....'
                 try:
@@ -217,10 +275,10 @@ class CustomTrainer(Trainer):
         print(f"当前解冻的Transformer层索引: {sorted(unfrozen_layer_indices)}")
         
         # 使用辅助方法获取参数组
-        transformer_params, hippo_params, new_optimizer_grouped_parameters = self._get_parameter_groups(model)
+        transformer_params, hippo_params, new_optimizer_grouped_parameters = self._get_parameter_groups(self.model)
         
         # 更新优化器的参数组
-        if hasattr(self.optimizer, 'param_groups'):
+        if hasattr(self, 'optimizer') and hasattr(self.optimizer, 'param_groups'):
             self.optimizer.param_groups.clear()
             for param_group in new_optimizer_grouped_parameters:
                 self.optimizer.add_param_group(param_group)
@@ -231,6 +289,8 @@ class CustomTrainer(Trainer):
             print(f"- HippoModel和门控机制参数数量: {sum(p.numel() for p in hippo_params):,}")
             print(f"- Transformer层学习率: 1e-5")
             print(f"- HippoModel学习率: 5e-5")
+        else:
+            print("警告: 优化器尚未创建或无效，无法更新参数组")
     
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         """用于推理阶段"""
@@ -263,16 +323,10 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token  # 设置pad token
     
-    # 加载并预处理训练数据
-    train_dataset = load_and_preprocess_data(
-        data_path=args.data_path,
-        tokenizer=tokenizer,
-        max_length=args.max_length
-    )
-    
-    # 加载并预处理测试数据
-    test_dataset = load_and_preprocess_data(
-        data_path=args.test_data_path,
+    # 使用load_train_val_data同时加载训练集和验证集
+    train_dataset, test_dataset = load_train_val_data(
+        train_path=args.data_path,
+        val_path=args.test_data_path,
         tokenizer=tokenizer,
         max_length=args.max_length
     )
@@ -287,14 +341,22 @@ def main():
     
     print(f"训练集大小: {len(train_dataset)}, 测试集大小: {len(test_dataset)}")
     
-    # 初始化带自定义模块的模型
-    model = ModifiedQwen(base_model_name_or_path=args.model_name_or_path)
-    
-    # 确保初始状态下只训练Hippo模型和门控机制，冻结所有transformer层
-    # 这样第一个epoch只会训练Hippo模型，让它先适应大模型的特征
-    model.freeze_all()  # 先冻结所有参数
-    model.unfreeze_hippo_model()  # 只解冻Hippo模型和门控机制
-    print("初始状态设置：只训练Hippo模型和门控机制，冻结所有transformer层")
+    # 初始化模型 - 如果从检查点恢复，则使用from_pretrained加载完整模型状态
+    if args.resume_from_checkpoint is not None:
+        print(f"从检查点恢复训练: {args.resume_from_checkpoint}")
+        # 从检查点目录加载完整模型（包括自定义模块参数和训练状态）
+        model = ModifiedQwen.from_pretrained(args.resume_from_checkpoint)
+        print("已从检查点加载模型，包括自定义模块参数和训练阶段状态")
+    else:
+        print("从零开始训练新模型")
+        # 初始化带自定义模块的模型
+        model = ModifiedQwen(base_model_name_or_path=args.model_name_or_path)
+        
+        # 确保初始状态下只训练Hippo模型和门控机制，冻结所有transformer层
+        # 这样第一个epoch只会训练Hippo模型，让它先适应大模型的特征
+        model.freeze_all()  # 先冻结所有参数
+        model.unfreeze_hippo_model()  # 只解冻Hippo模型和门控机制
+        print("初始状态设置：只训练Hippo模型和门控机制，冻结所有transformer层")
     
     # 数据收集器（处理batch内的padding等）
     data_collator = DataCollatorForLanguageModeling(
@@ -357,17 +419,17 @@ def main():
         compute_metrics=CustomTrainer.compute_metrics  # 设置计算指标的方法
     )
     
-    # 优化器创建将由CustomTrainer的create_optimizer方法处理
-    
     # 开始训练
-    print("开始训练...")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     
     # 保存最终模型
-    print(f"训练完成，开始保存模型...")
+    print("训练完成，开始保存模型...")
+    # 确保模型保存目录存在
+    import os
+    os.makedirs(args.output_dir, exist_ok=True)
     # 使用模型的自定义保存方法，确保所有参数都能正确保存
     model.save_pretrained(args.output_dir)
-    print(f"模型保存完成！")
+    print(f"模型已保存到 {args.output_dir}！")
 
 if __name__ == "__main__":
     main()

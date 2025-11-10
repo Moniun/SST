@@ -43,7 +43,8 @@ class ModifiedQwen(nn.Module):
         # 移除硬编码设备分配，让HippoModel自动匹配基础模型的设备
         self.hippo_model = HippoModel(
             input_dim=self.hidden_size,
-            output_dim=self.hidden_size
+            output_dim=self.hidden_size,
+            hippo_scale=0.1  # 添加缩放因子，提高训练稳定性
         ).to(self.base_model.device)  # 确保Hippo模型与基础模型在同一设备上
         
         # 初始化门控机制字典，为每个融合位置创建一个门控
@@ -57,6 +58,9 @@ class ModifiedQwen(nn.Module):
                 nn.Sigmoid()
             )
         
+        # 初始化门控机制参数
+        self._initialize_gate_mechanisms()
+        
         # 保存当前训练阶段
         self.current_stage = 0  # 0: 仅训练hippo模型, 1: 微调transformer相邻层
         
@@ -65,6 +69,9 @@ class ModifiedQwen(nn.Module):
         
         # 初始阶段：只解冻hippo模型
         self.unfreeze_hippo_model()
+
+        # 初始化隐藏状态,用在推理时
+        self.hidden_h = self.hippo_model.reset_h(batch_size=1)
 
     def freeze_all(self):
         """冻结所有参数"""
@@ -116,6 +123,19 @@ class ModifiedQwen(nn.Module):
         else:
             return f"已经在最后训练阶段（阶段{self.current_stage}）"
     
+    def _initialize_gate_mechanisms(self):
+        """初始化门控机制参数，使门控偏向基础模型输出（初始阶段稳定训练）"""
+        for gate_module in self.gate_mechanisms.values():
+            linear_layer = gate_module[0]  # 获取第一个线性层
+            
+            # 门控机制初始化为偏向基础模型输出（权重较小）
+            # 使用 Xavier 初始化，但降低权重方差
+            nn.init.xavier_uniform_(linear_layer.weight, gain=0.1)  # 较小的gain，使初始输出接近0
+            
+            # 偏置初始化为负值，使sigmoid输出接近0，优先使用基础模型输出
+            if linear_layer.bias is not None:
+                nn.init.constant_(linear_layer.bias, -2.0)
+    
     def get_trainable_params_info(self):
         """获取当前可训练参数信息"""
         trainable_params = 0
@@ -160,8 +180,8 @@ class ModifiedQwen(nn.Module):
         is_training = self.training
         
         # 获取嵌入层输出和位置编码
-        # 嵌入层通常是冻结的，在非训练状态下使用no_grad
-        with torch.set_grad_enabled(is_training):
+        # 嵌入层通常是冻结的，在任何状态下使用no_grad
+        with torch.no_grad():
             hidden_states = self.base_model.transformer.wte(input_ids)
             batch_size, seq_length = input_ids.shape
             past_key_values_length = 0
@@ -194,11 +214,12 @@ class ModifiedQwen(nn.Module):
                         
                         # 使用对话历史更新HippoModel的隐藏状态
                         _, h_initial = self.hippo_model(history_embeds, h_initial)
-        
+                        self.hidden_h = h_initial
+
         # 使用Hippo模型处理第一层transformer的输入，传入更新后的隐藏状态
         # Hippo模型在训练时需要计算梯度，推理时不需要
         with torch.set_grad_enabled(is_training and not self._is_hippo_frozen()):
-            hippo_output, _ = self.hippo_model(hidden_states, h_initial)
+            hippo_output, self.hidden_h = self.hippo_model(hidden_states, self.hidden_h)
         
         # 初始化past_key_values存储
         past_key_values = []
@@ -337,7 +358,9 @@ class ModifiedQwen(nn.Module):
         # 加载自定义模块参数
         custom_modules_path = os.path.join(pretrained_model_name_or_path, 'custom_modules.bin')
         if os.path.exists(custom_modules_path):
-            custom_state_dict = torch.load(custom_modules_path, map_location='cpu')
+            # 优先使用GPU加载模型参数，如果可用的话
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            custom_state_dict = torch.load(custom_modules_path, map_location=device)
             
             # 加载Hippo模型参数
             model.hippo_model.load_state_dict(custom_state_dict['hippo_model'])
@@ -348,6 +371,9 @@ class ModifiedQwen(nn.Module):
             # 恢复其他配置
             model.fusion_layers = custom_state_dict['fusion_layers']
             model.current_stage = custom_state_dict['current_stage']
+
+            # 重置隐藏状态为初始值，确保模型加载后状态正确
+            model.hidden_h = model.hippo_model.reset_h(batch_size=1)
             
             print(f"成功加载自定义模块参数")
             print(f"- Hippo模型参数")
@@ -362,7 +388,7 @@ class ModifiedQwen(nn.Module):
 if __name__ == "__main__":
     model = ModifiedQwen(
         base_model_name_or_path="Qwen/Qwen3-8B",
-        fusion_layers=[7, 15, 23],
+        fusion_layers=[0],
         cache_dir="qwen3-8b-custom-module-training"  # 可自定义路径
     )
     

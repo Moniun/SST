@@ -10,7 +10,8 @@ class HippoModel(nn.Module):
                  hidden_dim: int = 16,   # 隐藏状态维度
                  hippo_type: str = "LegS",  # Hippo矩阵类型
                  ffn_dim: int = 4096*4,     # 前馈网络中间层维度
-                 output_dim: int = 4096):  # 输出维度
+                 output_dim: int = 4096,    # 输出维度
+                 hippo_scale: float = 1.0): # Hippo矩阵缩放因子，默认为1.0（不缩放）
         """
         Hippo模型的基础实现，基于选择性状态空间模型(SSM)的序列建模
         
@@ -20,6 +21,8 @@ class HippoModel(nn.Module):
             hippo_type: Hippo矩阵类型，支持'LegT', 'LagT', 'LegS'
             ffn_dim: 前馈网络中间层维度
             output_dim: 最终输出维度
+            hippo_scale: Hippo矩阵的缩放因子，控制状态更新速率。即使矩阵固定，适当的缩放
+                        仍有助于提高数值稳定性和任务适应性。默认为1.0（保持原始值）
         """
         super().__init__()
         # 移除硬编码device，让模型可以自然地跟随pytorch的to(device)方法
@@ -28,12 +31,17 @@ class HippoModel(nn.Module):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.hippo_type = hippo_type
-        self.ffn_dim = input_dim*4
+        self.ffn_dim = ffn_dim  # 使用传入的ffn_dim参数
         self.output_dim = output_dim
+        self.hippo_scale = hippo_scale
         
         # 初始化Hippo矩阵（A）：用于隐藏状态的时序更新
+        # 使用原始Mamba实现方式，将A矩阵设为固定参数（不可学习）
         A_np = self._create_hippo_matrix(hidden_dim, hippo_type)
-        self.A = nn.Parameter(torch.tensor(A_np, dtype=torch.float32))
+        # 应用缩放因子，调节状态更新速率和数值稳定性
+        A_np = A_np * self.hippo_scale
+        # 使用register_buffer将其注册为非参数张量，不会参与梯度更新
+        self.register_buffer('A', torch.tensor(A_np, dtype=torch.float32))
         
         # 基础投影层，用于动态生成SSM参数
         self.b_proj = nn.Linear(input_dim, hidden_dim)
@@ -54,6 +62,33 @@ class HippoModel(nn.Module):
         # 层归一化
         self.norm1 = nn.LayerNorm(input_dim)
         self.norm2 = nn.LayerNorm(input_dim)
+        
+        # 自定义初始化
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        """自定义权重初始化方法，提高模型性能和稳定性"""
+        # 投影层使用Kaiming初始化，适合ReLU/GELU激活函数
+        for module in [self.b_proj, self.c_proj, self.d_proj, self.b_gate, self.c_gate]:
+            if isinstance(module, nn.Linear):
+                # Kaiming初始化，适合GELU等激活函数
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # 前馈网络使用GPT风格的初始化
+        for i, module in enumerate(self.ffn):
+            if isinstance(module, nn.Linear):
+                if i == 0:  # 第一层
+                    # 缩放的Kaiming初始化
+                    nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='gelu')
+                    # 对第一层进行缩放，提高训练稳定性
+                    module.weight.data *= 1.0 / (self.input_dim ** 0.25)
+                else:  # 第二层
+                    # 输出层使用较小的初始化值
+                    nn.init.normal_(module.weight, mean=0.0, std=2.0 / self.ffn_dim)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
     
     def _create_hippo_matrix(self, n: int, type_: str) -> np.ndarray:
         """
@@ -99,11 +134,13 @@ class HippoModel(nn.Module):
         """
         # 获取模型当前设备
         device = next(self.parameters()).device
-        return torch.zeros(
+        # 使用小随机初始化替代全零初始化，有助于打破对称性
+        # 使用标准差为0.01的正态分布初始化，提供微小的随机性
+        return torch.randn(
             batch_size, self.hidden_dim,
             dtype=torch.float32, 
             device=device
-        )
+        ) * 0.01
 
     def selective_scan(self, B: torch.Tensor, C: torch.Tensor, A: torch.Tensor, h_initial: torch.Tensor) -> torch.Tensor:
         """
@@ -194,9 +231,27 @@ class HippoModel(nn.Module):
         ffn_out = self.ffn(x)
         x = x + ffn_out  # 残差连接
         
-        # 计算最终隐藏状态（用于流式处理）：避免存储完整h序列，直接公式计算最后一步
-        last_h = h_initial * (torch.exp(self.A) ** seq_len) + \
-                 torch.sum(B * (torch.exp(self.A) ** (seq_len - 1 - torch.arange(seq_len, device=device))).view(1, -1, 1), dim=1)
+        # 计算最终隐藏状态（用于流式处理）
+        if seq_len == 1:
+            # 单步情况，需要重新计算隐藏状态，因为selective_scan不返回中间状态
+            # 执行单步的递推计算
+            delta = torch.exp(self.A).view(1, -1)  # (1, hidden_dim)
+            last_h = delta * h_initial + B[:, 0]
+        else:
+            # 多步情况，使用矩阵指数计算更高效的方式
+            # 计算指数衰减因子的幂次
+            exp_A = torch.exp(self.A)
+            # 计算h_initial的衰减
+            h_initial_decay = h_initial * (exp_A ** seq_len)
+            
+            # 创建衰减因子的几何序列
+            # 对于第i个时间步的B，其权重为exp_A^(seq_len-1-i)
+            decay_factors = exp_A.view(1, 1, -1) ** (seq_len - 1 - torch.arange(seq_len, device=device)).view(1, -1, 1)
+            
+            # 计算所有B的加权和
+            b_contribution = torch.sum(B * decay_factors, dim=1)
+            
+            last_h = h_initial_decay + b_contribution
         
         # 返回输出和最终隐藏状态，支持链式流式调用
         return x, last_h
