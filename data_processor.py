@@ -2,7 +2,7 @@ from datasets import Dataset, load_dataset
 import json
 import torch
 
-def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None):
+def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None, processed_data_path=None):
     """
     加载并预处理数据，支持dialog_history、memory_query、memory_answer格式
     
@@ -12,6 +12,9 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None):
         max_length: 最大序列长度（默认为None，会自动从tokenizer获取模型最大长度）
         split: 数据集分割名称（用于Hugging Face数据集，如'train'、'validation'、'test'）
               对于JSONL文件，此参数无效
+        processed_data_path: 预处理数据保存和加载的路径
+                            如果该路径存在已处理好的数据，则直接使用；
+                            如果不存在，则处理数据并保存到该路径
     """
     # 如果未指定max_length，尝试从tokenizer或其配置中获取模型最大长度
     if max_length is None:
@@ -57,20 +60,27 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None):
         memory_query = example.get("memory_query", "")
         memory_answer = example.get("memory_answer", "")
         
-        # 对对话历史中的每一句话进行编码
-        encoded_dialog_history = []
-        for history_item in dialog_history:
-            if history_item:  # 确保不为空
-                # 编码对话历史中的每个回合
-                history_encoding = tokenizer(
-                    history_item,
-                    padding="max_length",
-                    truncation=True,
-                    max_length=max_length,
-                    return_tensors="pt"
-                )
-                # 将编码后的input_ids添加到列表中
-                encoded_dialog_history.append(history_encoding["input_ids"][0])
+        # 1. 固定最大对话轮数（根据需求调整，比如5）
+        max_history_rounds = 12
+        # 2. 获取pad_token_id（避免硬编码）
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        # 3. 初始化固定形状的二维张量（填充pad_token_id）
+        encoded_dialog_history = torch.full((max_history_rounds, max_length), pad_token_id, dtype=torch.long)
+        
+        # 4. 编码有效对话轮次，填入张量
+        for i, history_item in enumerate(dialog_history[:max_history_rounds]):  # 限制不超过最大轮数
+            if not history_item:  # 跳过空字符串
+                continue
+            # 编码单轮对话
+            history_encoding = tokenizer(
+                history_item,
+                padding="max_length",
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt"
+            )
+            # 填入二维张量的第i行（覆盖pad填充）
+            encoded_dialog_history[i] = history_encoding["input_ids"][0]
         
         # 为大模型准备输入：只使用memory_query作为输入（减少计算量）
         model_input = memory_query
@@ -116,16 +126,51 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None):
             "labels": labels
         }
     
+    # 首先尝试从已保存的预处理数据加载（如果指定了保存路径且存在）
+    if processed_data_path:
+        import os
+        if (processed_data_path.endswith('.json') or processed_data_path.endswith('.jsonl')) and os.path.exists(processed_data_path):
+            print(f"从已保存的JSON文件加载预处理数据: {processed_data_path}")
+            from datasets import load_dataset
+            tokenized_dataset = load_dataset('json', data_files=processed_data_path)
+            # 将数据集字典转换为Dataset对象
+            tokenized_dataset = tokenized_dataset['train']
+            print(f"成功加载已预处理数据，共 {len(tokenized_dataset)} 条")
+            return tokenized_dataset
+        elif os.path.exists(processed_data_path) and os.path.isdir(processed_data_path):
+            print(f"从已保存的Dataset目录加载预处理数据: {processed_data_path}")
+            from datasets import load_from_disk
+            tokenized_dataset = load_from_disk(processed_data_path)
+            print(f"成功加载已预处理数据，共 {len(tokenized_dataset)} 条")
+            return tokenized_dataset
+        else:
+            print(f"未找到已保存的预处理数据，将进行预处理并保存到 {processed_data_path}")
+    
     # 应用预处理
     print(f"开始预处理数据...")
     # 注意：由于我们需要保留dialog_histories等非张量列，不使用remove_columns
     tokenized_dataset = dataset.map(preprocess_function)
     print(f"数据预处理完成")
     
+    # 保存预处理数据（如果指定了保存路径）
+    if processed_data_path:
+        print(f"保存预处理数据到: {processed_data_path}")
+        import os
+        # 确保目录存在
+        os.makedirs(os.path.dirname(os.path.abspath(processed_data_path)), exist_ok=True)
+        
+        # 根据文件扩展名选择保存格式
+        if processed_data_path.endswith('.json') or processed_data_path.endswith('.jsonl'):
+            tokenized_dataset.to_json(processed_data_path)
+        else:
+            # 默认保存为HuggingFace的Dataset格式（目录）
+            tokenized_dataset.save_to_disk(processed_data_path)
+        print(f"数据保存成功")
+    
     return tokenized_dataset
 
 
-def load_train_val_data(train_path, val_path, tokenizer, max_length=None):
+def load_train_val_data(train_path, val_path, tokenizer, max_length=None, train_processed_path=None, val_processed_path=None):
     """
     加载并预处理训练集和验证集数据
     
@@ -134,16 +179,22 @@ def load_train_val_data(train_path, val_path, tokenizer, max_length=None):
         val_path: 验证集文件路径（JSONL格式）
         tokenizer: 分词器
         max_length: 最大序列长度
-        
+        train_processed_path: 训练集预处理数据保存和加载的路径
+                             如果该路径存在已处理好的数据，则直接使用；
+                             如果不存在，则处理数据并保存到该路径
+        val_processed_path: 验证集预处理数据保存和加载的路径
+                            如果该路径存在已处理好的数据，则直接使用；
+                            如果不存在，则处理数据并保存到该路径
+                            
     Returns:
         tuple: (tokenized_train_dataset, tokenized_val_dataset)
     """
-    # 加载并预处理训练集
+    # 加载并预处理训练集（支持从已保存的预处理数据加载）
     print(f"处理训练集: {train_path}")
-    train_dataset = load_and_preprocess_data(train_path, tokenizer, max_length)
+    train_dataset = load_and_preprocess_data(train_path, tokenizer, max_length, processed_data_path=train_processed_path)
     
-    # 加载并预处理验证集
+    # 加载并预处理验证集（支持从已保存的预处理数据加载）
     print(f"处理验证集: {val_path}")
-    val_dataset = load_and_preprocess_data(val_path, tokenizer, max_length)
+    val_dataset = load_and_preprocess_data(val_path, tokenizer, max_length, processed_data_path=val_processed_path)
     
     return train_dataset, val_dataset

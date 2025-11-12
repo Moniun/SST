@@ -4,6 +4,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from hippo_model import HippoModel
 
+# 内存优化配置
+import os
+# 启用TF32加速计算
+torch.backends.cuda.matmul.allow_tf32 = True
+# 启用cudnn基准测试以选择最佳卷积算法
+torch.backends.cudnn.benchmark = True
+
 class ModifiedQwen(nn.Module):
     """包装Qwen3-8B并插入单个HippoModel，在transformer层间进行门控融合"""
     def __init__(self, base_model_name_or_path, fusion_layers=None, cache_dir="qwen3-8b-custom-module-training"):
@@ -14,13 +21,14 @@ class ModifiedQwen(nn.Module):
             trust_remote_code=True
         )
         
-        # 加载基础模型
+        # 加载基础模型，使用混合精度和内存优化
         self.base_model = AutoModelForCausalLM.from_pretrained(
             base_model_name_or_path,
             device_map="auto",
             trust_remote_code=True,
             cache_dir=cache_dir,
-            torch_dtype=torch.bfloat16  # 使用bfloat16以减少显存占用
+            torch_dtype=torch.bfloat16,  # 使用bfloat16混合精度以减少显存占用
+            low_cpu_mem_usage=True  # 减少CPU内存使用
         )
         
         # 获取模型配置
@@ -93,18 +101,30 @@ class ModifiedQwen(nn.Module):
             param.requires_grad = True
         for param in self.gate_mechanisms.parameters():
             param.requires_grad = True
+            
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        """启用梯度检查点以节省内存"""
+        # 将梯度检查点功能传递给基础模型
+        if hasattr(self.base_model, 'gradient_checkpointing_enable'):
+            self.base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+    
+    def gradient_checkpointing_disable(self):
+        """禁用梯度检查点"""
+        # 将梯度检查点功能传递给基础模型
+        if hasattr(self.base_model, 'gradient_checkpointing_disable'):
+            self.base_model.gradient_checkpointing_disable()
     
     def unfreeze_adjacent_layers(self):
         """解冻与融合位置相邻的Transformer层参数"""
         for layer_idx in self.fusion_layers:
             # 解冻当前层
-            if 0 <= layer_idx < len(self.base_model.transformer.h):
-                for param in self.base_model.transformer.h[layer_idx].parameters():
+            if 0 <= layer_idx < len(self.base_model.model.layers):
+                for param in self.base_model.model.layers[layer_idx].parameters():
                     param.requires_grad = True
             
             # 解冻下一层（如果存在）
-            if layer_idx + 1 < len(self.base_model.transformer.h):
-                for param in self.base_model.transformer.h[layer_idx + 1].parameters():
+            if layer_idx + 1 < len(self.base_model.model.layers):
+                for param in self.base_model.model.layers[layer_idx + 1].parameters():
                     param.requires_grad = True
     
     def advance_training_stage(self):
@@ -179,42 +199,54 @@ class ModifiedQwen(nn.Module):
         # 检查当前是否处于训练状态
         is_training = self.training
         
+        # 获取批次大小和序列长度
+        batch_size, seq_length = input_ids.shape
+        past_key_values_length = 0
+        
+        # 初始化attention_mask为全1（假设所有位置都可见）
+        # Qwen3通常期望float类型的attention_mask
+        attention_mask = torch.ones_like(input_ids, dtype=torch.float, device=input_ids.device)
+        
+        # 正确初始化position_ids，Qwen3模型需要这个输入来生成旋转位置编码
+        position_ids = torch.arange(
+            past_key_values_length,
+            past_key_values_length + seq_length,
+            dtype=torch.long,
+            device=input_ids.device
+        ).unsqueeze(0)
+        
         # 获取嵌入层输出和位置编码
-        # 嵌入层通常是冻结的，在任何状态下使用no_grad
+        # 嵌入层通常是冻结的，在任何状态下使用no_grad节省内存
         with torch.no_grad():
-            hidden_states = self.base_model.transformer.wte(input_ids)
-            batch_size, seq_length = input_ids.shape
-            past_key_values_length = 0
-            
-            # 应用位置编码
-            hidden_states = hidden_states + self.base_model.transformer.wpe(input_ids)
+            # 使用模型的embed_tokens获取词嵌入
+            hidden_states = self.base_model.model.embed_tokens(input_ids)
 
         # 当dialog_histories不为None时，使用对话历史更新HippoModel的隐藏状态
-        if dialog_histories is not None and len(dialog_histories) > 0:
+        if dialog_histories is not None:
             # 证明模型是在训练
             is_training = True
-            
+            # 解析格式维度
+            batch_size, num_turns, seq_len = dialog_histories.shape
             # 初始化隐藏状态
             h_initial = self.hippo_model.reset_h(batch_size)
-            
-            # 遍历对话历史中的每一句话，更新隐藏状态
-            # dialog_histories是一个包含每轮对话历史的列表，每个元素是(batch_size, seq_len)的tensor
-            for history_batch in dialog_histories:
-                if history_batch is not None and history_batch.numel() > 0:
-                    # 确保对话历史是二维的(batch_size, seq_len)格式
-                    if len(history_batch.shape) == 1:
-                        # 如果是一维，添加batch维度
-                        history_batch = history_batch.unsqueeze(0)
-                    
-                    # 对话历史的嵌入转换和Hippo模型更新都不计算梯度
-                    # 只需要获取隐藏状态h，不需要更新Hippo模型参数
-                    with torch.no_grad():
-                        history_embeds = self.base_model.transformer.wte(history_batch)
-                        history_embeds = history_embeds + self.base_model.transformer.wpe(history_batch)
                         
-                        # 使用对话历史更新HippoModel的隐藏状态
-                        _, h_initial = self.hippo_model(history_embeds, h_initial)
-                        self.hidden_h = h_initial
+            # 按轮次遍历（原逻辑是遍历列表，现在遍历张量的num_turns维度）
+            for turn_idx in range(num_turns):
+                history_batch = dialog_histories[:, turn_idx, :]  # 取第turn_idx轮 (batch_size, seq_len)
+                
+                # 跳过全为pad的轮次
+                if (history_batch == self.tokenizer.pad_token_id).all():
+                    continue
+
+                # 对话历史的嵌入转换和Hippo模型更新都不计算梯度以节省内存
+                # 只需要获取隐藏状态h，不需要更新Hippo模型参数
+                with torch.no_grad():
+                    # 计算历史嵌入（仅词嵌入，不需要为历史对话单独添加位置编码）
+                    history_embeds = self.base_model.model.embed_tokens(history_batch)
+                    
+                    # 更新Hippo隐藏状态
+                    _, h_initial = self.hippo_model(history_embeds, h_initial)
+                    self.hidden_h = h_initial
 
         # 使用Hippo模型处理第一层transformer的输入，传入更新后的隐藏状态
         # Hippo模型在训练时需要计算梯度，推理时不需要
@@ -227,16 +259,18 @@ class ModifiedQwen(nn.Module):
         all_attentions = []
         
         # 处理每一层transformer
-        for layer_idx, layer in enumerate(self.base_model.transformer.h):
+        for layer_idx, layer in enumerate(self.base_model.model.layers):
             # 检查当前层是否冻结
             is_layer_frozen = self._is_layer_frozen(layer_idx)
             
             # 对冻结的层在非训练状态下使用no_grad来节省显存
             with torch.set_grad_enabled(is_training and not is_layer_frozen):
-                # 执行原始transformer层计算
+                # 执行原始transformer层计算，确保符合Qwen3模型的参数要求
+                # position_ids用于Qwen3的旋转位置编码计算
                 layer_outputs = layer(
                     hidden_states,
                     attention_mask=attention_mask,
+                    position_ids=position_ids,
                     output_attentions=is_training,  # 训练时才保存注意力权重，进一步节省显存
                     use_cache=True
                 )
@@ -252,7 +286,7 @@ class ModifiedQwen(nn.Module):
                 # 只在训练时保存注意力权重
                 if is_training:
                     all_attentions.append(layer_outputs[1])
-            
+                
             # 检查当前层是否是需要融合Hippo输出的位置
             if layer_idx in self.fusion_layers:
                 # 门控机制是否冻结
@@ -270,15 +304,15 @@ class ModifiedQwen(nn.Module):
                     hidden_states = gate_weight * hippo_output + (1 - gate_weight) * hidden_states
         
         # 应用最终的层归一化
-        hidden_states = self.base_model.transformer.ln_f(hidden_states)
+        hidden_states = self.base_model.model.norm(hidden_states)
         
-        # 计算logits
-        logits = self.base_model.lm_head(hidden_states)
+        # 最终通过output层获取logits
+        logits = self.base_model.output(hidden_states)
         
         # 构造输出对象（已在顶部导入）
         return CausalLMOutputWithPast(
             logits=logits,
-            past_key_values=past_key_values if self.base_model.transformer.use_cache else None,
+            past_key_values=past_key_values,
             hidden_states=tuple(all_hidden_states),
             attentions=tuple(all_attentions)
         )
@@ -289,8 +323,8 @@ class ModifiedQwen(nn.Module):
     
     def _is_layer_frozen(self, layer_idx):
         """检查指定Transformer层是否被冻结"""
-        if 0 <= layer_idx < len(self.base_model.transformer.h):
-            return not any(p.requires_grad for p in self.base_model.transformer.h[layer_idx].parameters())
+        if 0 <= layer_idx < len(self.base_model.model.layers):
+            return not any(p.requires_grad for p in self.base_model.model.layers[layer_idx].parameters())
         return True
     
     def _is_gate_frozen(self, layer_idx):
@@ -310,9 +344,11 @@ class ModifiedQwen(nn.Module):
             return self.base_model.generate(*args, **kwargs)
     
     def save_pretrained(self, save_directory):
-        """自定义保存方法，确保所有子模块参数都能正确保存"""
+        """自定义保存方法，确保所有子模块参数都能正确保存，同时优化内存使用"""
         import os
-        from transformers.trainer_utils import set_seed
+        
+        # 清理GPU缓存以节省内存
+        torch.cuda.empty_cache()
         
         # 创建保存目录
         os.makedirs(save_directory, exist_ok=True)
@@ -323,7 +359,7 @@ class ModifiedQwen(nn.Module):
         # 保存分词器
         self.tokenizer.save_pretrained(save_directory)
         
-        # 保存自定义模块参数
+        # 保存自定义模块参数，优化内存使用
         custom_state_dict = {
             'hippo_model': self.hippo_model.state_dict(),
             'gate_mechanisms': self.gate_mechanisms.state_dict(),

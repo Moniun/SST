@@ -80,8 +80,8 @@ class HippoModel(nn.Module):
         for i, module in enumerate(self.ffn):
             if isinstance(module, nn.Linear):
                 if i == 0:  # 第一层
-                    # 缩放的Kaiming初始化
-                    nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='gelu')
+                    # 缩放的Kaiming初始化，对于GELU使用linear作为近似
+                    nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='linear')
                     # 对第一层进行缩放，提高训练稳定性
                     module.weight.data *= 1.0 / (self.input_dim ** 0.25)
                 else:  # 第二层

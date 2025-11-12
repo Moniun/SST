@@ -9,6 +9,8 @@ __pycache__/
 *$py.class
 # 特定Python文件
 validate_data.py
+test_model.py
+count_params.py
 
 # 环境文件
 venv/
