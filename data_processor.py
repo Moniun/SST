@@ -2,7 +2,7 @@ from datasets import Dataset, load_dataset
 import json
 import torch
 
-def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None, processed_data_path=None):
+def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None, processed_data_path=None, max_history_rounds=12):
     """
     加载并预处理数据，支持dialog_history、memory_query、memory_answer格式
     
@@ -15,6 +15,7 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None, 
         processed_data_path: 预处理数据保存和加载的路径
                             如果该路径存在已处理好的数据，则直接使用；
                             如果不存在，则处理数据并保存到该路径
+        max_history_rounds: 最大对话轮数（默认为12）
     """
     # 如果未指定max_length，尝试从tokenizer或其配置中获取模型最大长度
     if max_length is None:
@@ -60,8 +61,7 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None, 
         memory_query = example.get("memory_query", "")
         memory_answer = example.get("memory_answer", "")
         
-        # 1. 固定最大对话轮数（根据需求调整，比如5）
-        max_history_rounds = 12
+        # 使用传入的max_history_rounds参数（默认为12）
         # 2. 获取pad_token_id（避免硬编码）
         pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         # 3. 初始化固定形状的二维张量（填充pad_token_id）
@@ -170,7 +170,7 @@ def load_and_preprocess_data(data_path, tokenizer, max_length=None, split=None, 
     return tokenized_dataset
 
 
-def load_train_val_data(train_path, val_path, tokenizer, max_length=None, train_processed_path=None, val_processed_path=None):
+def load_train_val_data(train_path, val_path, tokenizer, max_length=None, train_processed_path=None, val_processed_path=None, max_history_rounds=12):
     """
     加载并预处理训练集和验证集数据
     
@@ -185,16 +185,17 @@ def load_train_val_data(train_path, val_path, tokenizer, max_length=None, train_
         val_processed_path: 验证集预处理数据保存和加载的路径
                             如果该路径存在已处理好的数据，则直接使用；
                             如果不存在，则处理数据并保存到该路径
+        max_history_rounds: 最大对话轮数（默认为12）
                             
     Returns:
         tuple: (tokenized_train_dataset, tokenized_val_dataset)
     """
     # 加载并预处理训练集（支持从已保存的预处理数据加载）
     print(f"处理训练集: {train_path}")
-    train_dataset = load_and_preprocess_data(train_path, tokenizer, max_length, processed_data_path=train_processed_path)
+    train_dataset = load_and_preprocess_data(train_path, tokenizer, max_length, processed_data_path=train_processed_path, max_history_rounds=max_history_rounds)
     
     # 加载并预处理验证集（支持从已保存的预处理数据加载）
     print(f"处理验证集: {val_path}")
-    val_dataset = load_and_preprocess_data(val_path, tokenizer, max_length, processed_data_path=val_processed_path)
+    val_dataset = load_and_preprocess_data(val_path, tokenizer, max_length, processed_data_path=val_processed_path, max_history_rounds=max_history_rounds)
     
     return train_dataset, val_dataset
