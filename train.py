@@ -9,7 +9,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
     AutoModelForCausalLM
 )
-from torch.cuda.amp import autocast
+from torch.cuda.amp import GradScaler
 from torch import nn
 from data_processor import load_train_val_data
 import argparse
@@ -18,7 +18,6 @@ from nltk.translate.meteor_score import meteor_score
 from sentence_transformers import SentenceTransformer
 from sentence_transformers import util as sentence_transformer_util
 from sentence_transformers.util import cos_sim as calculate_cosine_similarity
-from model_customization import ModifiedQwen
 from lora_model_customization import HippoLoRAQwen
 
 
@@ -51,24 +50,19 @@ def parse_args():
     parser.add_argument("--val_processed_path", type=str, default="./processed_data/val_dataset", help="验证数据预处理后保存和加载的路径")
     
     # Hippo和LoRA相关参数
-    parser.add_argument("--fusion_layers", type=str, default="2", 
+    parser.add_argument("--fusion_layers", type=str, default="12", 
                        help="指定要应用Hippo/LoRA的层列表，用逗号分隔，如'10,20,30'。在lora和full方法中都会被使用")
     parser.add_argument("--last_n_tokens", type=int, default=0, 
                        help="指定Hippo模型在训练时只关注input_ids的最后N个token，0表示处理所有token")
     
     # LoRA微调参数
-    parser.add_argument("--lora_rank", type=int, default=8, help="LoRA的rank参数")
-    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA的alpha参数")
-    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA的dropout参数")
+    parser.add_argument("--lora_rank", type=int, default=16, help="LoRA的rank参数")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA的alpha参数")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA的dropout参数")
     parser.add_argument("--attn_lora_config", type=str, default=None, 
                        help="注意力层LoRA配置，JSON格式，如'{\"rank\": 16, \"alpha\": 32}'")
     parser.add_argument("--ffn_lora_config", type=str, default=None, 
                        help="FFN层LoRA配置，JSON格式，如'{\"rank\": 8, \"alpha\": 64}'")
-    
-    # 训练控制参数
-    parser.add_argument("--finetuning_method", type=str, default="lora", choices=["lora", "full"], 
-                       help="微调方法选择：lora表示使用lora_model_customization.py进行LoRA微调，"
-                            "full表示使用model_customization.py进行全参数微调")
     
     # 训练参数
     parser.add_argument("--num_train_epochs", type=int, default=2)
@@ -77,8 +71,8 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--eval_accumulation_steps", type=int, default=8, help="评估时的梯度累积步数（增加以模拟更大batch）")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="权重衰减参数")
-    parser.add_argument("--transformer_learning_rate", type=float, default=1e-6, help="Transformer层的学习率")
-    parser.add_argument("--hippo_learning_rate", type=float, default=1e-6, help="HippoModel的学习率")
+    parser.add_argument("--transformer_learning_rate", type=float, default=1e-4, help="Transformer层的学习率")
+    parser.add_argument("--hippo_learning_rate", type=float, default=1e-4, help="HippoModel的学习率")
     parser.add_argument("--warmup_ratio", type=float, default=0.05, help="学习率预热比例")
     parser.add_argument("--max_steps", type=int, default=-1, help="最大训练步数，-1表示由epoch决定")
     
@@ -108,18 +102,17 @@ def parse_args():
 
     return parser.parse_args()
 
-# 优化的CustomTrainer类，专门处理内存问题
+# 简化的CustomTrainer类，只包含必要的优化
 class OptimizedTrainer(Trainer):
     def __init__(self, *args, cmd_args=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.cmd_args = cmd_args
-        self.first_epoch_completed = False
-        self.transformer_layers_unfrozen = False
         self.current_epoch = 0
         self.custom_tokenizer = AutoTokenizer.from_pretrained(cmd_args.model_name_or_path)
         # 延迟加载Sentence-BERT模型
         self._sbert_model = get_sbert_model()
 
+        # 重写compute_metrics方法
         self.compute_metrics = self._compute_metrics
         
     @property
@@ -128,155 +121,101 @@ class OptimizedTrainer(Trainer):
             self._sbert_model = get_sbert_model()
         return self._sbert_model
     
-    def _compute_metrics(self, eval_pred, compute_result=False):
-        """内存优化的评估指标计算（支持批次累积）"""
+    def _compute_metrics(self, eval_pred):
+        """内存优化的评估指标计算"""
         predictions, labels = eval_pred
 
-        # ==================== 初始化累积变量（首次调用时） ====================
-        if not hasattr(self, "accumulated_metrics"):
-            self.accumulated_metrics = {
-                # F1相关累积值
-                "true_positives": 0,
-                "predicted_positives": 0,
-                "actual_positives": 0,
-                # METEOR相关累积值（用总和+计数代替列表，节省内存）
-                "meteor_sum": 0.0,
-                "meteor_count": 0,
-                # SBERT相关累积值
-                "sbert_sum": 0.0,
-                "sbert_count": 0,
-                # 总样本数
-                "total_samples": 0
-            }
-
-        # ==================== 中间批次逻辑（累积结果，不返回最终指标） ====================
-        if not compute_result:
-            # 1. 限制单批次样本量（避免超过总限制）
-            max_total_samples = self.cmd_args.eval_sample_limit
-            remaining_samples = max_total_samples - self.accumulated_metrics["total_samples"]
-            if remaining_samples <= 0:
-                return  # 已达样本上限，停止累积
+        # 1. 计算Token级指标（F1相关）
+        predictions = torch.argmax(torch.tensor(predictions), dim=-1)
+        mask = labels != -100  # 过滤无效标签（-100）
+        
+        true_positives = ((predictions == labels) & mask).sum().item()
+        predicted_positives = mask.sum().item()  # 预测的有效位置数
+        actual_positives = mask.sum().item()     # 实际的有效位置数
+        
+        precision = true_positives / predicted_positives if predicted_positives > 0 else 0.0
+        recall = true_positives / actual_positives if actual_positives > 0 else 0.0
+        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        
+        # 2. 限制评估样本数量以节省内存
+        max_samples = min(len(predictions), self.cmd_args.eval_sample_limit)
+        predictions = predictions[:max_samples]
+        labels = labels[:max_samples]
+        
+        # 3. 计算METEOR和SBERT相似度（仅对限制后的样本）
+        meteor_scores = []
+        sbert_similarities = []
+        
+        batch_size = self.cmd_args.metric_batch_size
+        total_batches = (len(predictions) + batch_size - 1) // batch_size
+        
+        for batch_idx in range(total_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(predictions))
             
-            current_batch_size = len(predictions)
-            actual_use_samples = min(current_batch_size, remaining_samples)
-            if actual_use_samples < current_batch_size:
-                print(f"批次样本截断：{current_batch_size} -> {actual_use_samples}（总样本已达上限）")
-                predictions = predictions[:actual_use_samples]
-                labels = labels[:actual_use_samples]
+            batch_preds = predictions[start_idx:end_idx]
+            batch_labels = labels[start_idx:end_idx]
+            batch_masks = mask[start_idx:end_idx]
             
-            # 2. 计算当前批次的Token级指标（F1相关）
-            predictions = torch.argmax(torch.tensor(predictions), dim=-1)
-            mask = labels != -100  # 过滤无效标签（-100）
-            
-            batch_true_positives = ((predictions == labels) & mask).sum().item()
-            batch_predicted_positives = mask.sum().item()  # 预测的有效位置数
-            batch_actual_positives = mask.sum().item()     # 实际的有效位置数（与预测位置一致，因mask相同）
-            
-            # 3. 累积Token级指标
-            self.accumulated_metrics["true_positives"] += batch_true_positives
-            self.accumulated_metrics["predicted_positives"] += batch_predicted_positives
-            self.accumulated_metrics["actual_positives"] += batch_actual_positives
-            
-            # 4. 处理当前批次的语义级指标（METEOR和SBERT）
-            batch_size = self.cmd_args.metric_batch_size  # 内部小批量处理，减少内存压力
-            total_batch_in_chunk = (len(predictions) + batch_size - 1) // batch_size
-            
-            for chunk_idx in range(total_batch_in_chunk):
-                start = chunk_idx * batch_size
-                end = min(start + batch_size, len(predictions))
-                chunk_preds = predictions[start:end]
-                chunk_labels = labels[start:end]
-                chunk_masks = mask[start:end]
+            for i in range(len(batch_preds)):
+                pred = batch_preds[i]
+                label = batch_labels[i]
+                msk = batch_masks[i]
                 
-                for i in range(len(chunk_preds)):
-                    pred = chunk_preds[i]
-                    label = chunk_labels[i]
-                    msk = chunk_masks[i]
+                # 过滤无效位置，解码文本
+                valid_pred_ids = pred[msk].tolist()
+                valid_label_ids = label[msk].tolist()
+                
+                try:
+                    pred_text = self.custom_tokenizer.decode(valid_pred_ids, skip_special_tokens=True).strip()
+                    label_text = self.custom_tokenizer.decode(valid_label_ids, skip_special_tokens=True).strip()
                     
-                    # 过滤无效位置，解码文本
-                    valid_pred_ids = pred[msk].tolist()
-                    valid_label_ids = label[msk].tolist()
+                    if not (pred_text and label_text):
+                        continue  # 跳过空文本
                     
-                    try:
-                        pred_text = self.custom_tokenizer.decode(valid_pred_ids, skip_special_tokens=True).strip()
-                        label_text = self.custom_tokenizer.decode(valid_label_ids, skip_special_tokens=True).strip()
-                        
-                        if not (pred_text and label_text):
-                            continue  # 跳过空文本
-                        
-                        # 计算METEOR并累积
-                        pred_tokens = pred_text.split()
-                        label_tokens = label_text.split()
-                        if pred_tokens and label_tokens:
-                            try:
-                                meteor = meteor_score([label_tokens], pred_tokens)
-                                self.accumulated_metrics["meteor_sum"] += meteor
-                                self.accumulated_metrics["meteor_count"] += 1
-                            except Exception:
-                                continue
-                        
-                        # 计算SBERT相似度并累积
+                    # 计算METEOR
+                    pred_tokens = pred_text.split()
+                    label_tokens = label_text.split()
+                    if pred_tokens and label_tokens:
                         try:
-                            pred_embedding = self._sbert_model.encode(pred_text, convert_to_tensor=True)
-                            label_embedding = self._sbert_model.encode(label_text, convert_to_tensor=True)
-                            similarity = calculate_cosine_similarity(pred_embedding, label_embedding).item()
-                            self.accumulated_metrics["sbert_sum"] += similarity
-                            self.accumulated_metrics["sbert_count"] += 1
-                            
-                            # 及时释放显存
-                            del pred_embedding, label_embedding
-                            torch.cuda.empty_cache()
+                            meteor = meteor_score([label_tokens], pred_tokens)
+                            meteor_scores.append(meteor)
                         except Exception:
-                            continue
+                            pass
+                    
+                    # 计算SBERT相似度
+                    try:
+                        pred_embedding = self._sbert_model.encode(pred_text, convert_to_tensor=True)
+                        label_embedding = self._sbert_model.encode(label_text, convert_to_tensor=True)
+                        similarity = calculate_cosine_similarity(pred_embedding, label_embedding).item()
+                        sbert_similarities.append(similarity)
                         
+                        # 及时释放显存
+                        del pred_embedding, label_embedding
                     except Exception:
-                        continue
-                
-                # 每处理10个小批次清理一次内存
-                if chunk_idx % 10 == 0:
-                    gc.collect()
-                    torch.cuda.empty_cache()
-            
-            # 5. 累积总样本数
-            self.accumulated_metrics["total_samples"] += actual_use_samples
-            return  # 中间批次不返回指标
-
-
-        # ==================== 最后批次逻辑（汇总计算最终指标） ====================
-        else:
-            # 1. 从累积结果计算全局F1
-            tp = self.accumulated_metrics["true_positives"]
-            pp = self.accumulated_metrics["predicted_positives"]
-            ap = self.accumulated_metrics["actual_positives"]
-            
-            precision = tp / pp if pp > 0 else 0.0
-            recall = tp / ap if ap > 0 else 0.0
-            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-            
-            # 2. 计算全局METEOR和SBERT平均
-            avg_meteor = (self.accumulated_metrics["meteor_sum"] / self.accumulated_metrics["meteor_count"]
-                            if self.accumulated_metrics["meteor_count"] > 0 else 0.0)
-            
-            avg_sbert = (self.accumulated_metrics["sbert_sum"] / self.accumulated_metrics["sbert_count"]
-                            if self.accumulated_metrics["sbert_count"] > 0 else 0.0)
-            
-            # 3. 输出评估结果
-            print(f"\n===== 评估结果 (Epoch {self.current_epoch}) =====")
-            print(f"- F1分数 (Token级): {f1_score:.4f}")
-            print(f"- METEOR分数 (语义级): {avg_meteor:.4f}")
-            print(f"- Sentence-BERT相似度 (语义级): {avg_sbert:.4f}")
-            print(f"- 评估样本数: {self.accumulated_metrics['total_samples']}")
-            print("====================\n")
-            
-            # 4. 重置累积变量（避免影响下一次评估）
-            del self.accumulated_metrics
-            
-            # 5. 返回最终指标
-            return {
-                "f1": f1_score,
-                "meteor": avg_meteor,
-                "sbert_similarity": avg_sbert
-            }
+                        pass
+                        
+                except Exception:
+                    continue
+        
+        # 计算平均值
+        avg_meteor = sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0.0
+        avg_sbert = sum(sbert_similarities) / len(sbert_similarities) if sbert_similarities else 0.0
+        
+        # 输出评估结果
+        print(f"\n===== 评估结果 (Epoch {self.current_epoch}) =====")
+        print(f"- F1分数 (Token级): {f1_score:.4f}")
+        print(f"- METEOR分数 (语义级): {avg_meteor:.4f}")
+        print(f"- Sentence-BERT相似度 (语义级): {avg_sbert:.4f}")
+        print(f"- 评估样本数: {len(predictions)}")
+        print("====================\n")
+        
+        # 返回最终指标
+        return {
+            "f1": f1_score,
+            "meteor": avg_meteor,
+            "sbert_similarity": avg_sbert
+        }
     
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         """内存优化的评估流程"""
@@ -302,8 +241,8 @@ class OptimizedTrainer(Trainer):
         
         return metrics
     
-    def on_epoch_begin(self, epoch, logs=None):
-        self.current_epoch = epoch + 1
+    def on_epoch_begin(self, args, state, control, **kwargs):
+        self.current_epoch += 1
         print(f"\n===== 开始训练第 {self.current_epoch} 个epoch =====", flush=True)
         
         # 内存清理
@@ -337,22 +276,16 @@ def main():
         print("使用默认fusion_layers: [10, 20, 30]")
         fusion_layers_list = [10, 20, 30]
     
-    # 根据微调方法设置输出目录
-    model_type_dir = {
-        "lora": "lora_finetuning",
-        "full": "full_parameter_finetuning"
-    }
-    
-    # 确保基础输出目录和对应的子目录存在
+    # 设置输出目录
     os.makedirs(args.base_output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.base_output_dir, "hippo_model"), exist_ok=True)
-    os.makedirs(os.path.join(args.base_output_dir, model_type_dir[args.finetuning_method]), exist_ok=True)
+    os.makedirs(os.path.join(args.base_output_dir, "lora_finetuning"), exist_ok=True)
     
     # 设置最终的输出目录
-    args.output_dir = os.path.join(args.base_output_dir, model_type_dir[args.finetuning_method])
+    args.output_dir = os.path.join(args.base_output_dir, "lora_finetuning")
     
     print(f"基础输出目录: {args.base_output_dir}")
-    print(f"微调方法: {args.finetuning_method}")
+    print(f"微调方法: lora")
     print(f"模型保存目录: {args.output_dir}")
     
     # 设置CUDA内存优化参数
@@ -387,54 +320,39 @@ def main():
     # 加载模型
     if args.resume_from_checkpoint is not None:
         print(f"从检查点恢复训练: {args.resume_from_checkpoint}")
-        if args.finetuning_method == "lora":
-            model = HippoLoRAQwen.from_pretrained(args.resume_from_checkpoint, fusion_layers=fusion_layers_list)
-        else:
-            model = ModifiedQwen.from_pretrained(args.resume_from_checkpoint, fusion_layers=fusion_layers_list)
+        model = HippoLoRAQwen.from_pretrained(args.resume_from_checkpoint, fusion_layers=fusion_layers_list)
     else:
         print("从零开始训练新模型")
-        if args.finetuning_method == "lora":
-            print("使用LoRA微调方法")
+        print("使用LoRA微调方法")
+        
+        # 解析JSON格式的LoRA配置
+        attn_config = None
+        ffn_config = None
+        
+        try:
+            if args.attn_lora_config:
+                attn_config = json.loads(args.attn_lora_config)
+                print(f"注意力层LoRA配置: {attn_config}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"attn_lora_config JSON格式错误: {e}")
             
-            # 解析JSON格式的LoRA配置
-            attn_config = None
-            ffn_config = None
-            
-            try:
-                if args.attn_lora_config:
-                    attn_config = json.loads(args.attn_lora_config)
-                    print(f"注意力层LoRA配置: {attn_config}")
-            except json.JSONDecodeError as e:
-                raise ValueError(f"attn_lora_config JSON格式错误: {e}")
-                
-            try:
-                if args.ffn_lora_config:
-                    ffn_config = json.loads(args.ffn_lora_config)
-                    print(f"FFN层LoRA配置: {ffn_config}")
-            except json.JSONDecodeError as e:
-                raise ValueError(f"ffn_lora_config JSON格式错误: {e}")
-            
-            model = HippoLoRAQwen(
-                base_model_name_or_path=args.model_name_or_path, 
-                fusion_layers=fusion_layers_list,
-                seq_len=args.max_length,
-                lora_rank=args.lora_rank,
-                lora_alpha=args.lora_alpha,
-                lora_dropout=args.lora_dropout,
-                cache_dir=args.cache_dir,
-                last_n_tokens=args.last_n_tokens,
-                attn_lora_config=attn_config,
-                ffn_lora_config=ffn_config
-            )
-
-        else:
-            print("使用全参数微调方法")
-            model = ModifiedQwen(
-                base_model_name_or_path=args.model_name_or_path,
-                fusion_layers=fusion_layers_list,
-                cache_dir=args.cache_dir,
-                last_n_tokens=args.last_n_tokens
-            )
+        try:
+            if args.ffn_lora_config:
+                ffn_config = json.loads(args.ffn_lora_config)
+                print(f"FFN层LoRA配置: {ffn_config}")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"ffn_lora_config JSON格式错误: {e}")
+        
+        model = HippoLoRAQwen(
+            base_model_name_or_path=args.model_name_or_path, 
+            fusion_layers=fusion_layers_list,
+            seq_len=args.max_length,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            cache_dir=args.cache_dir,
+            last_n_tokens=args.last_n_tokens
+        )
     
     # 自定义数据收集器
     class CustomDataCollator(DataCollatorForLanguageModeling):
@@ -473,6 +391,7 @@ def main():
         max_steps=args.max_steps,
         fp16=args.fp16,
         bf16=args.bf16,
+        half_precision_backend="auto",  # 默认即可
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
@@ -490,6 +409,7 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         dataloader_pin_memory=False,  # 禁用pin_memory以节省内存
+        max_grad_norm=1.0,
         batch_eval_metrics=True  # 启用批量评估指标
     )
     
@@ -501,7 +421,6 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
         data_collator=data_collator,
-        # compute_metrics=OptimizedTrainer.compute_metrics,
         cmd_args=args
     )
     
@@ -524,39 +443,24 @@ def main():
             model_to_save.to('cpu')
             torch.cuda.empty_cache()
             
-            if args.finetuning_method == "lora":
-                print("保存LoRA微调模型...")
-                model_to_save.save_pretrained(
-                    save_directory=args.base_output_dir, 
-                    model_type="lora",
-                    save_hippo_components=True
-                )
-                model_to_save.save_pretrained(
-                    save_directory=args.base_output_dir, 
-                    model_type="hippo",
-                    save_hippo_components=True
-                )
-            else:
-                print("保存全参数微调模型...")
-                model_to_save.save_pretrained(
-                    save_directory=args.base_output_dir, 
-                    model_type="full"
-                )
-                model_to_save.save_pretrained(
-                    save_directory=args.base_output_dir, 
-                    model_type="hippo",
-                    save_hippo_components=True
-                )
+            print("保存LoRA微调模型...")
+            model_to_save.save_pretrained(
+                save_directory=args.base_output_dir, 
+                model_type="lora",
+                save_hippo_components=True
+            )
+            model_to_save.save_pretrained(
+                save_directory=args.base_output_dir, 
+                model_type="hippo",
+                save_hippo_components=True
+            )
             
             tokenizer.save_pretrained(args.output_dir)
             
             print(f"\n模型保存完成！")
             print(f"基础输出目录: {args.base_output_dir}")
             print(f"- Hippo组件保存在: {os.path.join(args.base_output_dir, 'hippo_model')}")
-            if args.finetuning_method == "lora":
-                print(f"- LoRA微调模型保存在: {os.path.join(args.base_output_dir, 'lora_finetuning')}")
-            else:
-                print(f"- 全参数微调模型保存在: {os.path.join(args.base_output_dir, 'full_parameter_finetuning')}")
+            print(f"- LoRA微调模型保存在: {os.path.join(args.base_output_dir, 'lora_finetuning')}")
                 
         except Exception as e:
             print(f"保存模型时出错: {e}")
@@ -569,6 +473,12 @@ def main():
             print("3. 减小eval_sample_limit参数")
             print("4. 减小Sentence-BERT评估的批次大小")
             print("5. 增加eval_accumulation_steps参数")
+        elif "Attempting to unscale FP16 gradients" in str(e):
+            print("\nFP16梯度缩放错误！可能的原因和解决方案：")
+            print("1. 梯度缩放器配置问题，已添加梯度缩放器处理")
+            print("2. 检查模型是否正确支持FP16")
+            print("3. 可以尝试禁用FP16训练 (--fp16=False)")
+            print("4. 确保PyTorch和Transformers版本兼容")
 
         raise e
     finally:

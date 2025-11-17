@@ -23,7 +23,7 @@ HIPPO系统的核心创新点在于：
                                     ▼
 ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
 │  当前查询输入   │ ────> │  基础大语言模型 │ ────> │    特征融合     │ ────> 增强输出
-│  (memory_query) │      │ (ModifiedQwen)  │      │                 │
+│  (memory_query) │      │ (Qwen)          │      │                 │
 └─────────────────┘      └─────────────────┘      └─────────────────┘
 ```
 
@@ -117,7 +117,6 @@ python train.py
 - `--data_path`: 训练数据路径，默认为"data/data_train.jsonl"
 - `--test_data_path`: 验证数据路径，默认为"data/data_val.jsonl"
 - `--base_output_dir`: 基础模型保存路径，默认为"./models"
-- `--finetuning_method`: 微调方法，支持"lora"和"full"，默认为"full"
 - `--num_train_epochs`: 训练轮数，默认为3
 - `--per_device_train_batch_size`: 每设备训练批次大小，默认为8
 - `--gradient_accumulation_steps`: 梯度累积步数，默认为2
@@ -128,11 +127,9 @@ python train.py
 - `--load_best_model`: 是否在训练结束时加载最佳模型
 
 训练过程中的关键特性：
-- 第一个epoch只训练Hippo模型和门控机制
-- 后续epoch自动解冻Transformer层进行联合训练
-- 差异化学习率：Hippo模型使用5e-5，Transformer层使用1e-5
+- Hippo模型采用LoRA微调方法，训练效率高
 - 自动保存最佳模型检查点
-- **分类保存机制**：根据微调方法将模型保存到不同目录
+- **简化保存机制**：模型保存到统一目录结构
 
 ### 推理使用
 
@@ -160,9 +157,9 @@ python inference.py --model_path ./models
 
 HIPPO模型会自动通过隐藏状态维护对话上下文，无需显式提供历史记录。这是系统的核心特性，允许模型在长对话中保持记忆。
 
-## 模型分类保存
+## 模型保存
 
-为了更好地组织和管理不同微调方式的模型，我们实现了分类保存机制。根据选择的微调方法，模型会被保存到不同的目录结构中。
+LoRA微调完成后，模型会被保存到统一的目录结构中，便于管理和部署。
 
 ### 目录结构
 
@@ -172,67 +169,40 @@ models/
 │   ├── hippo_components.bin    # Hippo模型和门控机制参数
 │   ├── config.json             # Hippo组件配置信息
 │   └── hippo_lora_components.pt # LoRA版本的Hippo组件
-├── lora_finetuning/            # LoRA微调模型保存目录
-│   ├── base_model/             # 基础模型权重
-│   ├── hippo_lora_components.pt # Hippo组件+LoRA参数
-│   ├── config.json             # 模型配置
-│   └── tokenizer/              # 分词器
-└── full_parameter_finetuning/  # 全参数微调模型保存目录
+└── lora_finetuning/            # LoRA微调模型保存目录
     ├── base_model/             # 基础模型权重
-    ├── custom_modules.bin      # Hippo自定义模块
+    ├── hippo_lora_components.pt # Hippo组件+LoRA参数
     ├── config.json             # 模型配置
     └── tokenizer/              # 分词器
 ```
 
 ### 训练命令示例
 
-#### LoRA微调训练
 ```bash
-# LoRA微调 - 模型会保存到lora_finetuning和hippo_model目录
+# LoRA微调训练 - 模型会保存到lora_finetuning和hippo_model目录
 python train.py \
-    --finetuning_method lora \
-    --model_name_or_path "Qwen/Qwen2-1.5B-Instruct" \
-    --base_output_dir "./models"
-```
-
-#### 全参数微调训练
-```bash
-# 全参数微调 - 模型会保存到full_parameter_finetuning和hippo_model目录
-python train.py \
-    --finetuning_method full \
     --model_name_or_path "Qwen/Qwen2-1.5B-Instruct" \
     --base_output_dir "./models"
 ```
 
 ### 推理命令示例
-
-#### LoRA模型推理
+  
 ```bash
-# 使用lora_finetuning目录中的模型
+# 使用LoRA微调模型进行推理
 python inference.py \
-    --model_type lora \
-    --model_path "./models/lora_finetuning"
+    --model_path "./models/lora_finetuning" \
+    --tokenizer_path "./models/lora_finetuning/tokenizer"
 ```
 
-#### 全参数模型推理
-```bash
-# 使用full_parameter_finetuning目录中的模型
-python inference.py \
-    --model_type full \
-    --model_path "./models/full_parameter_finetuning"
-```
+### LoRA微调优势
 
-### 微调方法对比
-
-| 维度 | LoRA微调 | 全参数微调 |
-|------|----------|------------|
-| 可训练参数 | ~5-10% | 100% |
-| 显存占用 | 低 | 高 |
-| 训练速度 | 快 | 慢 |
-| 存储空间 | 小 | 大 |
-| 性能表现 | 良好 | 最佳 |
-| hippo_model/ | ✓ | ✓ |
-| 专有目录 | lora_finetuning/ | full_parameter_finetuning/ |
+| 特性 | 优势 |
+|------|------|
+| 内存占用 | 低内存消耗，适合资源受限环境 |
+| 训练速度 | 训练速度快，效率高 |
+| 模型大小 | 参数更新量小，保存空间少 |
+| 部署便利性 | 易于部署和迁移 |
+| 保持性能 | 在保持性能的同时大幅减少参数
 
 ### 模型加载说明
 
@@ -247,31 +217,19 @@ model = HippoLoRAQwen.from_pretrained("./models/lora_finetuning")
 model = HippoLoRAQwen.from_pretrained("./models/hippo_model")
 ```
 
-#### ModifiedQwen模型（全参数微调）
-```python
-from model_customization import ModifiedQwen
 
-# 加载全参数微调模型
-model = ModifiedQwen.from_pretrained("./models/full_parameter_finetuning")
-
-# 单独加载Hippo组件
-model = ModifiedQwen.from_pretrained("./models/hippo_model")
-```
 
 ### 最佳实践
 
-1. **选择LoRA微调**: 当资源有限或需要快速实验时
-2. **选择全参数微调**: 当追求最佳性能且有充足计算资源时
-3. **Hippo组件共享**: hippo_model/目录中的组件可以被不同微调方式共享
-4. **版本管理**: 建议在不同目录下维护不同版本的模型，便于对比和回滚
-5. **矩阵版本优先**: 新项目推荐使用矩阵版本的Hippo模型，性能更优
+1. **LoRA微调**: 资源有限或需要快速实验时，LoRA是最佳选择
+2. **Hippo组件共享**: hippo_model/目录中的组件可以独立管理和部署
+3. **版本管理**: 建议在不同目录下维护不同版本的模型，便于对比和回滚
+4. **矩阵版本优先**: 新项目推荐使用矩阵版本的Hippo模型，性能更优
 
 ### 注意事项
 
-- 训练完成后会同时保存完整模型和Hippo组件
+- 训练完成后会保存完整的LoRA微调模型和Hippo组件
 - Hippo组件可以独立加载和部署
-- 推理时需要根据`--model_type`参数选择正确的模型类型
-- 不同微调方式的模型不可混用，需要使用对应的推理代码
 - **矩阵版本Hippo模型**与原始版本接口完全兼容，可直接替换
 
 ## 文件结构
@@ -280,10 +238,9 @@ model = ModifiedQwen.from_pretrained("./models/hippo_model")
 ├── data/                    # 数据文件夹
 │   ├── data_train.jsonl    # 训练数据集
 │   └── data_val.jsonl      # 验证数据集
-├── models/                  # 模型保存目录（分类保存）
-│   ├── hippo_model/        # Hippo组件通用目录
-│   ├── lora_finetuning/    # LoRA微调模型
-│   └── full_parameter_finetuning/ # 全参数微调模型
+├── models/                  # 模型保存目录
+│   ├── hippo_model/        # Hippo组件目录
+│   └── lora_finetuning/    # LoRA微调模型
 ├── data_processor.py        # 数据加载和预处理模块
 ├── generate_data.py         # 数据生成工具
 ├── hippo_model.py           # 记忆编码模型实现（包含矩阵版本）
@@ -291,7 +248,6 @@ model = ModifiedQwen.from_pretrained("./models/hippo_model")
 ├── matrix_hippo_model_summary.md # 矩阵版本技术文档
 ├── compare_models.py        # 原始vs矩阵版本性能对比
 ├── linear_vs_matrix_analysis.md # 参数优化分析报告
-├── model_customization.py   # 大模型定制和特征融合（全参数微调）
 ├── lora_model_customization.py # 大模型定制（LoRA微调）
 ├── train.py                 # 训练脚本
 ├── inference.py             # 推理脚本
@@ -324,11 +280,11 @@ model = ModifiedQwen.from_pretrained("./models/hippo_model")
 - **接口兼容**：与原始版本完全兼容，可直接替换
 - **计算过程**：h = A*h + B*x 和 y = C*h + D*x
 
-### 3. 模型集成与融合 (model_customization.py)
+### 3. 模型集成与融合 (lora_model_customization.py)
 
 - 集成基础大语言模型和记忆融合功能
 - 实现记忆特征与大模型输出的门控融合机制
-- 智能的参数冻结/解冻控制，支持训练阶段管理
+- 智能的参数冻结/解冻控制，支持LoRA微调阶段管理
 - 显存优化，降低推理时内存占用
 
 ### 4. 高级训练系统 (train.py)

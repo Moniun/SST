@@ -4,66 +4,51 @@ import torch.nn as nn
 from typing import Optional, Tuple
 
 class HippoModel(nn.Module):
-    def __init__(self, 
-                 input_dim: int = 4096,  # 输入维度
-                 output_dim: int = 4096,  # 输出维度
-                 hidden_dim: int = 16,   # 隐藏状态维度
-                 seq_len: int = 1024,    # 序列长度
+    def __init__(self, input_dim: int = 4096,
+                 output_dim: int = 4096,
+                 hidden_dim: int = 16,
+                 seq_len: int = 1024,
                  ffn_dim: int = 16,
-                 hippo_type: str = "LegS",  # Hippo矩阵类型
+                 hippo_type: str = "LegS",
                  hippo_scale: float = 1.0,
-                 dtype: torch.dtype = torch.float16):  # 新增：接收精度类型参数
-        """
-        基于矩阵的Hippo模型实现，支持与基座模型统一精度
-        
-        参数:
-            input_dim: 输入向量的维度
-            output_dim: 输出向量的维度
-            hidden_dim: 隐藏状态维度
-            seq_len: 序列长度
-            ffn_dim: 前馈网络中间维度
-            hippo_type: Hippo矩阵类型
-            hippo_scale: Hippo矩阵缩放因子
-            dtype: 模型计算精度类型（与基座模型保持一致）
-        """
+                 dtype: torch.dtype = torch.float16):  # 保留 dtype 用于 A 矩阵缩放参考，但不用于模块初始化
+
         super().__init__()
-        
-        # 核心参数
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.seq_len = seq_len
         self.hippo_type = hippo_type
         self.hippo_scale = hippo_scale
-        self.dtype = dtype  # 保存精度类型
-        
-        # 初始化Hippo矩阵A：(hidden_dim, hidden_dim)
+        self.model_dtype = dtype  # 仅作参考，不用于模块创建
+    
+        # 创建 Hippo 矩阵 A（始终用 float32 计算，避免数值问题）
         A_np = self._create_hippo_matrix(hidden_dim, hippo_type)
         A_np = A_np * self.hippo_scale
-        self.register_buffer('A', torch.tensor(A_np, dtype=dtype))  # 使用动态精度
-        
-        # 可学习矩阵参数 - 使用指定精度
-        self.B = nn.Parameter(torch.randn(hidden_dim, seq_len, dtype=dtype) * 0.01)
-        self.C = nn.Parameter(torch.randn(seq_len, hidden_dim, dtype=dtype) * 0.01)
-        
-        # D: 线性层序列 - 使用指定精度
+        # 注册为 float32 buffer，forward 时再转为输入 dtype
+        self.register_buffer('A', torch.tensor(A_np, dtype=torch.float32))
+    
+        # 可学习参数：用 float32 初始化，训练时由 AMP 自动处理
+        self.B = nn.Parameter(torch.randn(hidden_dim, seq_len) * 0.01)
+        self.C = nn.Parameter(torch.randn(seq_len, hidden_dim) * 0.01)
+    
+        # D 网络：不要传 dtype！
         self.D = nn.Sequential(
-            nn.Linear(seq_len, 16, dtype=dtype),
-            nn.Linear(16, seq_len, dtype=dtype),
+            nn.Linear(seq_len, 16),
+            nn.Linear(16, seq_len),
             nn.Sigmoid()
         )
-        
-        # 前馈网络 - 使用指定精度
+    
+        # FFN：同样不要传 dtype
         self.ffn = nn.Sequential(
-            nn.Linear(input_dim, ffn_dim, dtype=dtype),
+            nn.Linear(input_dim, ffn_dim),
             nn.GELU(),
-            nn.Linear(ffn_dim, output_dim, dtype=dtype)
+            nn.Linear(ffn_dim, output_dim)
         )
-        
-        # 层归一化 - 使用指定精度
-        self.norm1 = nn.LayerNorm(input_dim, dtype=dtype)
-        self.norm2 = nn.LayerNorm(input_dim, dtype=dtype)
-        
-        # 初始化参数
+    
+        # LayerNorm 也不传 dtype
+        self.norm1 = nn.LayerNorm(input_dim)
+        self.norm2 = nn.LayerNorm(input_dim)
+    
         self._initialize_weights()
         
     def _init_weights(self, module):
@@ -108,68 +93,55 @@ class HippoModel(nn.Module):
         return np.diag(diag)
 
     def reset_h(self, batch_size: int) -> torch.Tensor:
-        """初始化批次隐藏状态（使用模型指定精度）"""
         device = next(self.parameters()).device
-        return torch.randn(batch_size, self.hidden_dim, self.input_dim, 
-                          device=device, dtype=self.dtype) * 0.01  # 动态精度
+        # 返回 float32，forward 中会转为 input_dtype
+        return torch.randn(batch_size, self.hidden_dim, self.input_dim, device=device) * 0.01
 
-    def forward(self, 
-                batch_vectors: torch.Tensor,  # (batch_size, seq_len, input_dim)
+    def forward(self, batch_vectors: torch.Tensor,
                 h_initial: Optional[torch.Tensor] = None,
                 last_n_tokens: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        基于矩阵计算的forward过程（所有计算使用统一精度）
-        """
+    
         device = next(self.parameters()).device
-        
-        # 输入验证
         if not isinstance(batch_vectors, torch.Tensor) or batch_vectors.dim() != 3:
             raise ValueError("输入必须是形状为(batch_size, seq_len, input_dim)的张量")
-        
-        batch_vectors = batch_vectors.to(device, dtype=self.dtype)  # 转换为模型精度
-        batch_size, seq_len, input_dim = batch_vectors.size()
-        
-        # 支持选择性token处理
+    
+        # 获取输入的实际 dtype（可能是 float16 或 float32）
+        input_dtype = batch_vectors.dtype
+        batch_vectors = batch_vectors.to(device)
+    
+        batch_size, seq_len, input_dim = batch_vectors.shape
+    
         if last_n_tokens > 0 and last_n_tokens < seq_len:
             batch_vectors = batch_vectors[:, -last_n_tokens:, :]
             seq_len = last_n_tokens
-        
-        # 隐藏状态初始化（确保精度一致）
+    
         if h_initial is None:
-            h_initial = self.reset_h(batch_size)
+            h_initial = self.reset_h(batch_size).to(device, dtype=input_dtype)
         else:
-            if h_initial.shape != (batch_size, self.hidden_dim, input_dim):
-                raise ValueError(f"h_initial形状应为({batch_size}, {self.hidden_dim}, {input_dim})，实际为{h_initial.shape}")
-            h_initial = h_initial.to(device, dtype=self.dtype)  # 统一精度
-        
-        # 层归一化（使用模型精度）
-        x = self.norm1(batch_vectors)  # 已在初始化时指定dtype，无需额外转换
-        
-        # === 矩阵计算过程（统一使用模型精度） ===
-        A = self.A  # 已注册为指定dtype
-        B = self.B
-        C = self.C
-        
-        # h = A*h + B*x
+            h_initial = h_initial.to(device, dtype=input_dtype)
+    
+        x = self.norm1(batch_vectors.to(input_dtype))  # norm 自动适配
+    
+        # === 关键：将 A 转为当前计算 dtype ===
+        A = self.A.to(dtype=input_dtype)  # 原来是 float32，现在转为 fp16 或 fp32
+        B = self.B.to(dtype=input_dtype)
+        C = self.C.to(dtype=input_dtype)
+    
         hA = torch.matmul(A, h_initial)
-        Bx = torch.matmul(B, x)
+        Bx = torch.matmul(B, x.to(input_dtype))
         h_new = hA + Bx
-        
-        # y = C*h + D*x
+    
         Ch = torch.matmul(C, h_new)
-        
-        # D*x处理
+    
         x_perm = x.permute(0, 2, 1)
         x_flat = x_perm.reshape(-1, seq_len)
-        Dx_flat = self.D(x_flat)
-        Dx = Dx_flat.reshape(batch_size, input_dim, seq_len)
-        Dx = Dx.permute(0, 2, 1)
-        
+        Dx_flat = self.D(x_flat.to(input_dtype))  # D 内部自动 cast
+        Dx = Dx_flat.reshape(batch_size, input_dim, seq_len).permute(0, 2, 1)
+    
         y = Ch + Dx
-        
-        # === 前馈网络处理 ===
-        x = self.norm2(y)
-        ffn_out = self.ffn(x)
-        x = x + ffn_out  # 残差连接
-        
+    
+        x2 = self.norm2(y)
+        ffn_out = self.ffn(x2)
+        x_out = x2 + ffn_out
+    
         return ffn_out, h_new
