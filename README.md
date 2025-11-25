@@ -1,5 +1,4 @@
 # State Space Transformer
-# HIPPO: 对话历史记忆融合系统
 
 SST (State Space Transformer) 是一个结合对话历史记忆功能的大语言模型增强系统。该系统通过引入专门的记忆模型（HippoModel），使大语言模型能够更好地理解和利用对话历史信息，提供更加连贯和个性化的回答。
 
